@@ -9,3 +9,7 @@
 `terraform plan`
 `terraform apply`
 `terraform destroy`
+
+
+
+`uuidgen | tr '[:upper:]' '[:lower:]' | cut -d'-' -f1`

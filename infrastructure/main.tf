@@ -31,6 +31,13 @@ terraform {
       version = "~> 5.92"
     }
   }
+  backend "s3"{
+    bucket = "terraform-state-bucket-97da5e70"
+    key    = "terraform.tfstate"
+    region = "eu-central-1"
+    dynamodb_table = "terraform-state-locking"
+    encrypt = true
+  }
 
   required_version = ">= 1.2"
 }
@@ -100,3 +107,4 @@ resource "aws_instance" "example_instance" {
     Name = "ExampleInstance"
   }
 }
+
