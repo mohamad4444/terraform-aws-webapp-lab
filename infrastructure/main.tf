@@ -1,110 +1,282 @@
 # --------------------------
-# Variables
-# --------------------------
-variable "aws_region" {
-  description = "AWS region"
-  default     = "eu-central-1"
-}
-
-variable "ami_id" {
-  description = "AMI ID for the EC2 instance"
-  default     = "ami-01f79b1e4a5c64257"  # Ubuntu linux, eu-central-1
-}
-
-variable "instance_type" {
-  default = "t3.micro"
-}
-
-variable "key_name" {
-  description = "Your EC2 key pair name for SSH access"
-  default     = "terraform-keys" 
-}
-
-
-# --------------------------
-# Terraform & Provider
+# Terraform Backend & Provider
 # --------------------------
 terraform {
+  # Assumes s3 bucket and dynamo DB table already set up
+  # See backend-setup directory
+  backend "s3" {
+    bucket         = "terraform-state-bucket-97da5e70"
+    key            = "terraform.tfstate"
+    region         = "eu-central-1"
+    dynamodb_table = "terraform-state-locking"
+    encrypt        = true
+  }
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.92"
     }
   }
-  backend "s3"{
-    bucket = "terraform-state-bucket-97da5e70"
-    key    = "terraform.tfstate"
-    region = "eu-central-1"
-    dynamodb_table = "terraform-state-locking"
-    encrypt = true
-  }
 
   required_version = ">= 1.2"
 }
 
 provider "aws" {
-  region = var.aws_region
+  region = "eu-central-1"
 }
 
+# --------------------------
+# EC2 Instances (Web Servers)
+# --------------------------
+resource "aws_instance" "instance_1" {
+  ami             = "ami-01f79b1e4a5c64257" # Ubuntu 20.04 LTS // eu-central-1
+  instance_type   = "t3.micro"
+  security_groups = [aws_security_group.instances.name]
+  user_data       = <<-EOF
+              #!/bin/bash
+              echo "Hello, World 1" > index.html
+              python3 -m http.server 8080 &
+              EOF
 
+  tags = {
+    Name = "WebServer-1"
+  }
+}
+
+resource "aws_instance" "instance_2" {
+  ami             = "ami-01f79b1e4a5c64257" # Ubuntu 20.04 LTS // eu-central-1
+  instance_type   = "t3.micro"
+  security_groups = [aws_security_group.instances.name]
+  user_data       = <<-EOF
+              #!/bin/bash
+              echo "Hello, World 2" > index.html
+              python3 -m http.server 8080 &
+              EOF
+
+  tags = {
+    Name = "WebServer-2"
+  }
+}
 
 # --------------------------
-# Security Group
+# S3 Bucket (Application Data)
 # --------------------------
-resource "aws_security_group" "example_sg" {
-  name        = "example-sg"
-  description = "Allow SSH, HTTP, and HTTPS inbound traffic"
+resource "aws_s3_bucket" "bucket" {
+  bucket_prefix = "tf-web-app-data-97da5e70-"
+  force_destroy = true
+}
 
-  # SSH open to anyone
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+resource "aws_s3_bucket_versioning" "bucket_versioning" {
+  bucket = aws_s3_bucket.bucket.id
+  versioning_configuration {
+    status = "Enabled"
   }
+}
 
-  # HTTP
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+resource "aws_s3_bucket_server_side_encryption_configuration" "bucket_crypto_conf" {
+  bucket = aws_s3_bucket.bucket.bucket
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
   }
+}
 
-  # HTTPS
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+# --------------------------
+# VPC and Subnet Data Sources
+# --------------------------
+data "aws_vpc" "default_vpc" {
+  default = true
+}
+
+data "aws_subnets" "default_subnet" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default_vpc.id]
   }
+}
 
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+# --------------------------
+# Security Groups
+# --------------------------
+resource "aws_security_group" "instances" {
+  name        = "instance-security-group"
+  description = "Security group for web server instances"
+
+  tags = {
+    Name = "instance-sg"
+  }
+}
+
+resource "aws_security_group_rule" "allow_http_inbound" {
+  type              = "ingress"
+  security_group_id = aws_security_group.instances.id
+
+  from_port   = 8080
+  to_port     = 8080
+  protocol    = "tcp"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+
+resource "aws_security_group" "alb" {
+  name        = "alb-security-group"
+  description = "Security group for application load balancer"
+
+  tags = {
+    Name = "alb-sg"
+  }
+}
+
+resource "aws_security_group_rule" "allow_alb_http_inbound" {
+  type              = "ingress"
+  security_group_id = aws_security_group.alb.id
+
+  from_port   = 80
+  to_port     = 80
+  protocol    = "tcp"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+
+resource "aws_security_group_rule" "allow_alb_all_outbound" {
+  type              = "egress"
+  security_group_id = aws_security_group.alb.id
+
+  from_port   = 0
+  to_port     = 0
+  protocol    = "-1"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+
+# --------------------------
+# Application Load Balancer
+# --------------------------
+resource "aws_lb" "load_balancer" {
+  name               = "web-app-lb"
+  load_balancer_type = "application"
+  subnets            = data.aws_subnets.default_subnet.ids
+  security_groups    = [aws_security_group.alb.id]
+
+  tags = {
+    Name = "web-app-lb"
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.load_balancer.arn
+
+  port     = 80
+  protocol = "HTTP"
+
+  # By default, return a simple 404 page
+  default_action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "404: page not found"
+      status_code  = 404
+    }
+  }
+}
+
+resource "aws_lb_target_group" "instances" {
+  name     = "example-target-group"
+  port     = 8080
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default_vpc.id
+
+  health_check {
+    path                = "/"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 15
+    timeout             = 3
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
   }
 
   tags = {
-    Name = "example-sg"
+    Name = "instances-tg"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "instance_1" {
+  target_group_arn = aws_lb_target_group.instances.arn
+  target_id        = aws_instance.instance_1.id
+  port             = 8080
+}
+
+resource "aws_lb_target_group_attachment" "instance_2" {
+  target_group_arn = aws_lb_target_group.instances.arn
+  target_id        = aws_instance.instance_2.id
+  port             = 8080
+}
+
+resource "aws_lb_listener_rule" "instances" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 100
+
+  condition {
+    path_pattern {
+      values = ["*"]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.instances.arn
   }
 }
 
 # --------------------------
-# EC2 Instance
+# RDS PostgreSQL Database
 # --------------------------
-resource "aws_instance" "example_instance" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
- # key_name      = var.key_name
-
-  # Attach the security group
-  vpc_security_group_ids = [aws_security_group.example_sg.id]
+resource "aws_db_instance" "db_instance" {
+  allocated_storage = 20
+  # This allows any minor version within the major engine_version
+  # defined below, but will also result in allowing AWS to auto
+  # upgrade the minor version of your DB. This may be too risky
+  # in a real production environment.
+  auto_minor_version_upgrade = true
+  storage_type               = "standard"
+  engine                     = "postgres"
+  engine_version             = "12"
+  instance_class             = "db.t3.micro"
+  db_name                    = "mydb"
+  username                   = "foo"
+  password                   = "foobarbaz"
+  skip_final_snapshot        = true
 
   tags = {
-    Name = "ExampleInstance"
+    Name = "postgres-db"
   }
 }
 
+# --------------------------
+# Outputs
+# --------------------------
+output "instance_1_ip" {
+  description = "Public IP of web server 1"
+  value       = aws_instance.instance_1.public_ip
+}
+
+output "instance_2_ip" {
+  description = "Public IP of web server 2"
+  value       = aws_instance.instance_2.public_ip
+}
+
+output "load_balancer_dns" {
+  description = "DNS name of the load balancer"
+  value       = aws_lb.load_balancer.dns_name
+}
+
+output "database_endpoint" {
+  description = "Connection endpoint for the database"
+  value       = aws_db_instance.db_instance.endpoint
+}
+
+output "s3_bucket_name" {
+  description = "Name of the S3 bucket"
+  value       = aws_s3_bucket.bucket.id
+}
